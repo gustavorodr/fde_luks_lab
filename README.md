@@ -36,9 +36,7 @@ fde_luks_lab/
 ├── wordlists/                  # Custom dictionaries for FDE attacks
 │   └── generate_wordlists.py   # Specialized wordlist generator
 ├── results/                    # Attack outputs and forensic evidence
-├── lab_environment/            # Test environment setup scripts
-├── luks_pentest_master.py      # Master orchestration script
-└── PROJECT_OVERVIEW.md         # Detailed project documentation
+└── main.py      # Master orchestration script
 ```
 
 ## Installation and Setup
