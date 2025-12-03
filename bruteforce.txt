@@ -1,8 +1,145 @@
-dd if=/dev/sdX2 of=header.luks bs=512 count=32768
-# Ou usando cryptsetup
-cryptsetup luksHeaderBackup /dev/sdX2 --header-backup-file header.luks
+lsblk -f
+sudo blkid
 
-hashcat -m 14600 -a 0 header.luks wordlist.txt
+sudo cryptsetup luksDump /dev/sdb1
+
+dd if=/dev/sdX2 of=header.luks bs=512 count=32768
+# Ou usando cryptsetup (funciona para LUKS1 e LUKS2)
+sudo rm -f header.luks
+sudo cryptsetup luksHeaderBackup /dev/sdb1 --header-backup-file header.luks
+
+# LUKS2 (PBKDF2/HMAC-SHA256 – "fdbk2") com ferramentas open source
+#
+# Hashcat: use o modo LUKS2 (-m 29500). O -m 14600 é para LUKS (v1) e
+# não detecta corretamente LUKS2. O header deve ser passado diretamente.
+# Exemplo: Ataque de wordlist simples (CPU/GPU)
+hashcat -m 29500 -a 0 header.luks wordlist.txt
+
+gustavo@gustavo-Latitude-3490:~/Documents/fde_luks_lab$ hashcat -m 29500 -a 0 header.luks wordlist.txt
+hashcat (v6.2.6) starting
+
+Either the specified hash mode does not exist in the official repository,
+or the file(s) could not be found. Please check that the hash mode number is
+correct and that the files are in the correct place.
+
+/usr/share/hashcat/modules/module_29500.so: cannot open shared object file: No such file or directory
+
+Started: Wed Dec  3 08:42:03 2025
+Stopped: Wed Dec  3 08:42:03 2025
+gustavo@gustavo-Latitude-3490:~/Documents/fde_luks_lab$ ls /usr/share/hashcat/modules/
+
+# John the Ripper (Open Source) com OpenCL para LUKS2
+# 1) Extrair hash com utilitário john (luks2john)
+#    – Em muitas distribuições, o script vem com o JtR Jumbo.
+#    – Caso não tenha, compile o JtR Jumbo (open source) e use o utilitário.
+luks2john header.luks > hash_luks2.txt
+
+# 2) Rodar ataque de wordlist em GPU
+john --format=LUKS2-opencl --wordlist=wordlist.txt hash_luks2.txt
+
+# 3) Mostrar resultado (se houver)
+john --show hash_luks2.txt
+
+## Troubleshooting LUKS2 (Hashcat 29500)
+
+- Erro: "/usr/share/hashcat/modules/module_29500.so: cannot open shared object file"
+    - Causa: sua instalação do Hashcat não tem o módulo LUKS2 (29500).
+    - Soluções:
+        - Atualize Hashcat para versão mais recente disponível no sistema:
+            ```bash
+            sudo apt update
+            sudo apt install --only-upgrade hashcat
+            ```
+        - Se o repositório não possui 29500, instale via snap/flatpak ou compile:
+            ```bash
+            sudo snap install hashcat
+            # ou
+            sudo apt install build-essential git
+            git clone https://github.com/hashcat/hashcat.git
+            cd hashcat
+            make -j$(nproc)
+            sudo make install
+            ```
+        - Verifique suporte ao modo:
+            ```bash
+            hashcat --help | grep -E "29500|LUKS2"
+            ```
+
+- Permissão negada no header:
+    ```bash
+    sudo chown "$USER":"$USER" header.luks
+    chmod 644 header.luks
+    ```
+
+- Wordlist não encontrada:
+    ```bash
+    ls -lh wordlist.txt
+    # ou use caminho absoluto
+    hashcat -m 29500 -a 0 ./header.luks ./wordlist.txt
+    ```
+
+## Fallback 100% Open Source (John the Ripper Jumbo)
+
+- Instalação (Ubuntu/Debian):
+    ```bash
+    sudo apt update
+    sudo apt install john john-data
+    # Se a versão não tiver luks2john, compile o Jumbo:
+    sudo apt install build-essential libssl-dev git pkg-config
+    git clone https://github.com/openwall/john.git
+    cd john/src
+    ./configure && make -j$(nproc)
+    cd ../run
+    ```
+- Extração + ataque:
+    ```bash
+    ./luks2john /home/gustavo/Documents/fde_luks_lab/header.luks > /home/gustavo/Documents/fde_luks_lab/hash_luks2.txt
+    john --list=opencl-devices
+    john --format=LUKS2-opencl --wordlist=/home/gustavo/Documents/fde_luks_lab/wordlist.txt /home/gustavo/Documents/fde_luks_lab/hash_luks2.txt
+    john --show /home/gustavo/Documents/fde_luks_lab/hash_luks2.txt
+    ```
+
+## Instalação Offline do Hashcat a partir deste projeto
+
+- Pré-requisito: Tenha o código-fonte do Hashcat copiado localmente (sem internet) para dentro do projeto, por exemplo em `tools/vendor/hashcat/`.
+    - Estrutura esperada: `tools/vendor/hashcat/Makefile`, `tools/vendor/hashcat/modules/module_29500.so` após build.
+
+- Verifique se o código-fonte está presente:
+    ```bash
+    test -d tools/vendor/hashcat && echo "hashcat fonte encontrado" || echo "adicione o código em tools/vendor/hashcat"
+    ```
+
+- Compilar e instalar localmente (sem internet):
+    ```bash
+    sudo apt install build-essential git pkg-config || true
+    pushd tools/vendor/hashcat
+    make -j"$(nproc)"
+    # Instalar em prefixo local (não toca /usr):
+    make PREFIX="$(pwd)/dist" install
+    popd
+    ```
+
+- Validar que o módulo LUKS2 existe no build local:
+    ```bash
+    ls tools/vendor/hashcat/modules/module_29500.so
+    ```
+
+- Usar o binário local sem instalar no sistema:
+    ```bash
+    ./tools/vendor/hashcat/dist/bin/hashcat -I
+    ./tools/vendor/hashcat/dist/bin/hashcat --help | grep -E "29500|LUKS2"
+    ./tools/vendor/hashcat/dist/bin/hashcat -m 29500 -a 0 ./header.luks ./wordlist.txt
+    ```
+
+- Caso queira instalar no sistema (offline, a partir do código local):
+    ```bash
+    pushd tools/vendor/hashcat
+    sudo make install
+    popd
+    hashcat --help | grep -E "29500|LUKS2"
+    ```
+
+- Dica: se o sistema procura módulos em `/usr/share/hashcat/modules/`, a instalação via `make install` deve copiar os `.so` corretamente. Para execução direta do binário local, o Hashcat usa seus próprios caminhos internos do `dist/`.
 
 crunch 9 9 -t Admin%%%% -o wordlist_personalizada.txt
 
