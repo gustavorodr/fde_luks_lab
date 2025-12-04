@@ -1,0 +1,14 @@
+sudo python3 hashcat/tools/luks2hashcat.py /dev/sdb1 | tee results/luks2_sdb1.hash
+
+cd hashcat
+make clean && make
+cd ..
+./hashcat/hashcat -I
+./hashcat/hashcat -m 29521 -a 0 -D 1 -d <NUMERO_DA_GPU> results/luks2_sdb1.hash wordlist.txt
+./hashcat/hashcat -m 29521 -a 0 results/luks2_sdb1.hash wordlist.txt
+
+file file.efi
+srings file.efi
+objdump -x file.efi
+r2 -A file.efi
+

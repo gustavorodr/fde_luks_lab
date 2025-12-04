@@ -1,0 +1,343 @@
+Entendido. Vou buscar como configurar corretamente uma VM no AQEMU (via QEMU/KVM) com passthrough de dois pendrives físicos: um com uma instalação do Xubuntu onde o boot e a partição root estão criptografados via LUKS, e outro com o keyfile necessário para o desbloqueio automático da partição de boot. Também vou verificar como garantir que o initramfs da VM reconheça esse segundo pendrive no boot.
+
+Volto em breve com um guia detalhado para você.
+
+Perfeito — abaixo vem **um guia passo-a-passo completo** para a **Opção B**: anexar **os dois pendrives como discos brutos (raw)** na VM via AQEMU (ou via `qemu-system-*`), escolher qual é o disco de boot e garantir que o Xubuntu no pendrive consiga usar o keyfile do outro pendrive durante o boot. Vou incluir **comandos exatos**, exemplos de scripts para initramfs (caso precise) e instruções de diagnóstico. Substitua os nomes de dispositivos (`/dev/sdb`, `/dev/sdc`, `mykey.bin`) pelos que aparecerem no seu sistema.
+
+> ⚠️ **Aviso importante (faça backup):** esses passos mexem com discos físicos. Um erro pode sobrescrever dados do pendrive. Faça backup dos dados importantes antes de prosseguir.
+
+---
+
+# Resumo rápido da estratégia
+
+1. Identificar os dois pendrives no host e desmontá-los.
+2. (Opcional / recomendado) abrir temporariamente o LUKS no host para editar `/etc/crypttab` e regenerar `initramfs` no Xubuntu do pendrive — assim o guest já terá suporte a achar o keyfile no boot. (Essa etapa é feita montando via `cryptsetup` e `chroot`.)
+3. No AQEMU: criar/editar a VM e adicionar **dois discos** apontando para os dispositivos físicos `/dev/sdX` (formato `raw`, interface `virtio`). Ajustar boot para arrancar do disco correto e habilitar UEFI (OVMF) se o seu pendrive usa EFI.
+4. Iniciar a VM (execute o AQEMU como root ou garanta permissões), testar o boot e depurar se necessário.
+5. Ao terminar, feche mapeamentos e remova permissões temporárias.
+
+---
+
+# Pré-requisitos no host
+
+* `aqemu` instalado (ou você usará linha de comando `qemu-system-x86_64`).
+* `qemu-kvm` e `libvirt`/`kvm` (opcionalmente).
+* `ovmf` (para UEFI/EFI) instalado se seu pendrive usa EFI: em Debian/Ubuntu:
+
+```bash
+sudo apt update
+sudo apt install qemu-kvm ovmf
+```
+
+(Se `ovmf` não usar exatamente esse caminho no seu sistema, localize com `dpkg -L ovmf` ou `locate OVMF_CODE.fd`.)
+
+---
+
+# 1) Identificar os pendrives e desmontar tudo no host
+
+Conecte os dois pendrives e rode:
+
+```bash
+lsblk -o NAME,SIZE,MODEL,VENDOR,MOUNTPOINT
+# ou
+sudo fdisk -l
+```
+
+Saída típica mostra `/dev/sdb`, `/dev/sdc` e partições `/dev/sdb1`, etc. **Anote qual é qual** pelo tamanho/modelo.
+
+Desmonte quaisquer partições montadas:
+
+```bash
+sudo umount /dev/sdb1  # se montado
+sudo umount /dev/sdc1
+```
+
+Feche gerenciadores de arquivos para evitar automount.
+
+---
+
+# 2) (Recomendado) Preparar o Xubuntu no pendrive: garantir que initramfs saiba encontrar o keyfile
+
+> Por que recomendo isso? Se o boot EFI/GRUB do pendrive precisa do keyfile no segundo pendrive logo no *early boot*, é melhor garantir que o initramfs do próprio Xubuntu esteja configurado para localizar automaticamente o keyfile. Você fará isso **montando temporariamente** o sistema do pendrive no host (abrindo LUKS com o keyfile) e atualizando `/etc/crypttab` e o `initramfs`.
+
+## 2.1 Monte o pendrive do keyfile
+
+```bash
+# supondo /dev/sdc1 é o pendrive com o keyfile
+sudo mkdir -p /mnt/keyusb
+sudo mount /dev/sdc1 /mnt/keyusb
+# confirme
+ls /mnt/keyusb
+# ex: mykey.bin
+```
+
+## 2.2 Abra o LUKS do pendrive do sistema (temporariamente) usando o keyfile
+
+```bash
+# supondo /dev/sdb1 é a partição LUKS que contém o sistema do Xubuntu
+sudo cryptsetup luksOpen /dev/sdb1 cryptpendrive --key-file /mnt/keyusb/mykey.bin
+# agora existe: /dev/mapper/cryptpendrive
+```
+
+## 2.3 Monte o sistema e chroot para editar
+
+```bash
+sudo mkdir -p /mnt/pendrive
+sudo mount /dev/mapper/cryptpendrive /mnt/pendrive
+
+# se boot/EFI for separado (ex: /dev/sdb2), monte também:
+sudo mount /dev/sdb2 /mnt/pendrive/boot/efi   # ajuste conforme sua partição EFI/boot
+
+# monte pseudo-filesystems para chroot
+for d in sys proc dev run; do sudo mount --bind /$d /mnt/pendrive/$d; done
+
+sudo chroot /mnt/pendrive /bin/bash
+```
+
+## 2.4 No chroot: ajustar `/etc/crypttab` para usar o keyfile e garantir cryptsetup no initramfs
+
+Dentro do chroot (prompt root):
+
+1. Verifique UUID da partição LUKS:
+
+```bash
+blkid /dev/sdb1
+# anote UUID="..." 
+```
+
+2. Encontre identificador do pendrive da chave (dentro do chroot ele pode aparecer diferente) — prefira usar `/dev/disk/by-id/` para estabilidade:
+
+```bash
+ls -l /dev/disk/by-id/ | grep -i usb
+```
+
+3. Edite `/etc/crypttab` (exemplo usando keyfile via by-id):
+
+```text
+# /etc/crypttab
+cryptroot UUID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx /dev/disk/by-id/usb-Your_USB_ID-0:0:0:0/mykey.bin luks
+```
+
+Alternativa (se preferir): coloque o keyfile num caminho estático dentro do initramfs (veremos o hook abaixo).
+
+4. Garanta que `cryptsetup` e ferramentas estão instaladas:
+
+```bash
+apt update
+apt install cryptsetup-initramfs
+```
+
+(Nesse pacote `cryptsetup-initramfs` ele adiciona suporte a LUKS em initramfs; em outras distros o pacote pode se chamar diferente.)
+
+5. Regenerar initramfs:
+
+```bash
+update-initramfs -u -k all
+```
+
+6. Saia do chroot e desmonte:
+
+```bash
+exit   # sai do chroot
+for d in run dev proc sys; do sudo umount /mnt/pendrive/$d; done
+sudo umount /mnt/pendrive/boot/efi  # se montado
+sudo umount /mnt/pendrive
+# feche mapeamento
+sudo cryptsetup luksClose cryptpendrive
+# desmonte o pendrive da key
+sudo umount /mnt/keyusb
+```
+
+**Se preferir não montar/desbloquear no host:** pule essa seção — mas então pode ser necessário depurar o boot da VM e editar o initramfs a partir do guest.
+
+---
+
+# 3) Criar/Configurar a VM no AQEMU (passo a passo)
+
+> Vou descrever a UI do AQEMU e também mostrar a linha de comando `qemu-system-x86_64` equivalente, caso prefira.
+
+## 3.1 Executando AQEMU com permissões para acessar discos físicos
+
+Para que o QEMU leia `/dev/sdb` e `/dev/sdc` diretamente, o processo precisa de permissão. **A forma mais direta é rodar o AQEMU como root** (atenção ao risco):
+
+```bash
+sudo aqemu
+```
+
+(Se preferir não rodar como root, ajuste permissões/udev—mas isso é mais avançado.)
+
+## 3.2 Criar nova máquina no AQEMU
+
+1. Abra AQEMU (com `sudo aqemu` para facilitar).
+2. Clique em **"New"** (criar VM) → escolha **Name**, arquitetura x86_64, aloque memória (ex.: 4096 MB) e CPUs.
+3. Em **Hard Disk** → **Add**:
+
+   * Em vez de criar um arquivo .img, no campo **File** indique o dispositivo físico: `/dev/sdb` (o pendrive com o Xubuntu).
+   * **Format**: escolha `raw`.
+   * **Interface**: escolha `virtio` (melhor performance) ou `ide` se tiver problemas.
+   * Confirme.
+4. Adicione o segundo disco (pendrive com keyfile) da mesma forma: **Add** → file `/dev/sdc`, format `raw`, interface `virtio`.
+
+   * OBS: a ordem em que os discos aparecem na configuração pode influenciar os nomes no guest (vda/vdb ou sda/sdb). Se quiser garantir que o pendrive com Xubuntu seja o primeiro disco, adicione-o como Disk 0 / Ordered primeiro.
+5. Em **Boot** ou **CD / Boot options** (dependendo da versão do AQEMU), defina **Boot from Hard Disk** como primeira opção. Se houver opção para selecionar qual disco é o “First disk”, selecione o `/dev/sdb` (o Xubuntu).
+6. Habilitar **UEFI** (se o pendrive boota por EFI): procure opção "Use OVMF / Enable UEFI" no AQEMU; marque-a. Se não achar, você pode usar *Extra QEMU args* (ver seção abaixo).
+
+## 3.3 Extra QEMU args (se precisar de UEFI/OVMF ou opções avançadas)
+
+Se o AQEMU não expuser opção UEFI, adicione nos **Extra QEMU args**:
+
+* Exemplo com OVMF (paths típicos em Debian/Ubuntu — ajuste se diferente):
+
+```
+-drive if=pflash,format=raw,readonly,file=/usr/share/OVMF/OVMF_CODE.fd \
+-drive if=pflash,format=raw,file=/var/lib/OVMF/OVMF_VARS.fd
+```
+
+* Forçar interface virtio e cache:
+
+```
+-drive file=/dev/sdb,format=raw,if=virtio,cache=none -drive file=/dev/sdc,format=raw,if=virtio,cache=none
+```
+
+(Se já adicionou via GUI, não duplique.)
+
+**Importante:** AO usar dispositivos físicos, evite `cache=writeback` para reduzir risco de corrupção; `cache=none` é mais seguro.
+
+## 3.4 Salve e inicie a VM
+
+* Salve a configuração e clique **Start**.
+* A VM deve tentar bootar a partir do disco 1 (o pendrive com Xubuntu). Se o OVMF/EFI for necessário e estiver configurado, ele deve carregar o .efi do pendrive.
+
+---
+
+# 4) Linha de comando (alternativa direta com qemu-system-x86_64)
+
+Se preferir rodar sem AQEMU pra testar:
+
+```bash
+sudo qemu-system-x86_64 \
+  -enable-kvm -m 4096 -smp 2 \
+  -device virtio-blk-pci,drive=drive0 -drive id=drive0,file=/dev/sdb,format=raw,if=none,cache=none \
+  -device virtio-blk-pci,drive=drive1 -drive id=drive1,file=/dev/sdc,format=raw,if=none,cache=none \
+  -netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
+  -bios /usr/share/OVMF/OVMF_CODE.fd
+```
+
+Ajuste memória/CPUs. Se quiser persistir variáveis OVMF (NVRAM), adicione `-drive if=pflash,format=raw,file=/var/lib/OVMF/OVMF_VARS.fd` conforme necessário.
+
+---
+
+# 5) O que esperar no primeiro boot / debug
+
+* Se você **regenerou initramfs** corretamente (seção 2), o sistema deverá encontrar o keyfile no segundo pendrive e proceder com o desbloqueio do /boot e depois do root (senha).
+* Se o initramfs não encontrar o keyfile: o boot ficará em prompt do BusyBox ou pedirá senha para LUKS. Nesse caso, entre em modo de recuperação (ou use um livecd) e verifique:
+
+  * Em `/dev/disk/by-id/` se o dispositivo USB aparece com o mesmo id usado em `/etc/crypttab`.
+  * Verifique `dmesg` no initramfs (ou no prompt) para mensagens sobre udev e dispositivos USB.
+* Se a VM não enxerga `/dev/sdb` e `/dev/sdc` como discos, pode ser problema de permissão no host (QEMU não tem acesso aos dispositivos físicos). Solução: execute `sudo aqemu` ou ajuste permissions com udev.
+
+---
+
+# 6) Exemplos úteis de diagnóstico (host e guest)
+
+No host:
+
+```bash
+lsblk -f
+sudo fdisk -l
+sudo blkid /dev/sdb1
+dmesg | tail -n 50   # ver mensagens quando conectar pendrive
+```
+
+No guest (se ele entrou em shell initramfs):
+
+```bash
+cat /proc/partitions
+ls /dev/disk/by-id/
+blkid
+mount
+dmesg | less
+```
+
+---
+
+# 7) Exemplo de script initramfs (opcional, para procurar keyfile em qualquer pendrive USB)
+
+Se você teve problemas com `/dev/disk/by-id/` na initramfs, pode adicionar um simples script que procura um arquivo `mykey.bin` em dispositivos usb durante early-boot. Exemplo para Debian/Ubuntu (no sistema do pendrive, dentro do chroot):
+
+Crie `/etc/initramfs-tools/scripts/local-top/find-keyfile` com:
+
+```bash
+#!/bin/sh
+PREREQ=""
+prereqs()
+{
+    echo "$PREREQ"
+}
+case $1 in
+prereqs)
+    prereqs
+    exit 0
+    ;;
+esac
+
+# procura por mykey.bin em todos os dispositivos /dev/disk/by-id/usb-*
+for f in /dev/disk/by-id/usb-*; do
+  if [ -e "$f" ]; then
+    # para cada partição no dispositivo
+    for part in "$f"*; do
+      mountpoint="/tmp/keycheck"
+      mkdir -p "$mountpoint"
+      if mount -o ro "$part" "$mountpoint" 2>/dev/null; then
+        if [ -f "$mountpoint/mykey.bin" ]; then
+          # copie para /root (ou outro local) para ser usado pelo crypttab
+          cp "$mountpoint/mykey.bin" /root/mykey.bin
+          umount "$mountpoint"
+          exit 0
+        fi
+        umount "$mountpoint"
+      fi
+    done
+  fi
+done
+exit 0
+```
+
+Torne executável:
+
+```bash
+chmod +x /etc/initramfs-tools/scripts/local-top/find-keyfile
+update-initramfs -u
+```
+
+Depois configure `/etc/crypttab` para usar `/root/mykey.bin` como keyfile.
+
+> Esse script é um *exemplo prático* — adapte nomes e caminhos conforme sua situação. Ele monta partições temporariamente no initramfs para procurar `mykey.bin`.
+
+---
+
+# 8) Encerrando, desmontando e limpando no host
+
+Depois de usar (ou para preparar o sistema no host):
+
+```bash
+# se você abriu LUKS temporariamente no host antes
+sudo cryptsetup luksClose cryptpendrive
+
+# se montou o pendrive do key
+sudo umount /mnt/keyusb
+```
+
+---
+
+# Dicas finais / problemas comuns
+
+* **Permissões:** se QEMU não tiver acesso a `/dev/sdX` a VM não verá o disco — o jeito rápido é `sudo aqemu`. Uma alternativa mais segura é criar regras udev para dar permissão ao grupo `kvm/libvirt` — mais trabalhoso.
+* **Ordem dos discos:** a ordem de adição influencia qual disco será `vda`/`vdb`. Garanta que o disco com Xubuntu esteja definido como *first disk* / Boot device.
+* **EFI:** se o pendrive foi instalado com UEFI, você precisa do firmware OVMF no QEMU/AQEMU; caso contrário o boot UEFI falhará.
+* **Cache:** use `cache=none` em discos raw para reduzir risco de corrupção.
+* **Root encriptado e senha + keyfile:** seu setup (boot LUKS de /boot com keyfile + root com password) funcionará se o initramfs do sistema conseguir achar o keyfile no early boot. Se não, a VM pedirá senha manualmente para cada LUKS que não foi desbloqueado.
+
+---
+
+Se quiser eu já **faço os comandos adaptados ao seu caso**: cole aqui o resultado de `lsblk -o NAME,SIZE,MODEL,VENDOR,MOUNTPOINT` e `lsusb` e eu monto os comandos exatos (`cryptsetup`/`mount`/comando `qemu-system-x86_64` ou as opções de AQEMU) substituindo os IDs reais. Ou, se preferir, eu te mostro **o script initramfs** mais robusto já prontinho para colar. Qual prefere?
